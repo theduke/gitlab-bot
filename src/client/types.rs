@@ -60,7 +60,7 @@ pub struct Assignee {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Project {
-    pub id: i64,
+    pub id: u64,
     pub description: Option<String>,
     pub default_branch: String,
     pub visibility: String,
@@ -170,8 +170,8 @@ pub struct Milestone {
     pub title: String,
     pub description: String,
     pub state: String,
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub due_date: Option<DateTime<Utc>>,
 }
 
@@ -218,7 +218,7 @@ pub struct MergeRequest {
     pub title: String,
     pub state: String,
     pub created_at: Option<DateTime<Utc>>,
-    pub updated_at: String,
+    pub updated_at: DateTime<Utc>,
     pub upvotes: u64,
     pub downvotes: u64,
     pub author: Author,
@@ -235,7 +235,7 @@ pub struct MergeRequest {
     pub merge_commit_sha: Option<String>,
     pub user_notes_count: u64,
     pub changes_count: Option<String>,
-    pub should_remove_source_branch: Option<String>,
+    pub should_remove_source_branch: Option<bool>,
     pub force_remove_source_branch: bool,
     pub web_url: String,
     pub time_stats: MergeRequestTimeStats,
@@ -311,42 +311,3 @@ pub struct Job {
   */
 }
 
-#[derive(Clone, Debug)]
-pub struct FullMergeRequest {
-    pub project: Project,
-    pub request: MergeRequest,
-    pub source_branch: Branch,
-    pub source_branch_commits: Vec<Commit>,
-    pub target_branch_commits: Vec<Commit>,
-    pub comments: Vec<Note>,
-    pub bot_comments: Vec<Note>,
-    pub pipelines: Vec<Pipeline>,
-
-    pub repo_config: ::client::RepoConfig,
-}
-
-impl FullMergeRequest {
-    pub fn has_bot_comment(&self, marker: &str, max_age_days: Option<i64>) -> bool {
-        let now = Utc::now();
-        self.bot_comments
-            .iter()
-            .find(|c| {
-                // If max age is set, drop all older comments.
-                if let Some(days) = max_age_days.clone() {
-                    if c.created_at < now - Duration::days(days) {
-                        return false;
-                    }
-                }
-                // Only check comments which contain marker.
-                if c.body.contains(marker) == false {
-                    return false;
-                }
-                true
-            })
-            .is_some()
-    }
-
-    pub fn job_url(&self, job_id: u64) -> String {
-        format!("{}/-/jobs/{}", self.project.web_url, job_id)
-    }
-}

@@ -1,3 +1,8 @@
+use std::collections::{HashMap};
+use std::borrow::Borrow;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
 use failure::Error;
 use tokio_core::reactor::Handle;
 use slog::Logger;
@@ -8,6 +13,124 @@ use chrono::{Duration, Utc};
 
 use client;
 use client::types;
+
+#[derive(Clone, Debug)]
+pub struct FullMergeRequest {
+    pub project: types::Project,
+    pub request: types::MergeRequest,
+    pub source_branch: types::Branch,
+    pub source_branch_commits: Vec<types::Commit>,
+    pub target_branch_commits: Vec<types::Commit>,
+    pub comments: Vec<types::Note>,
+    pub bot_comments: Vec<types::Note>,
+    pub pipelines: Vec<types::Pipeline>,
+
+    pub repo_config: ::client::RepoConfig,
+}
+
+impl FullMergeRequest {
+    pub fn has_bot_comment(&self, marker: &str, max_age_days: Option<i64>) -> bool {
+        let now = Utc::now();
+        self.bot_comments
+            .iter()
+            .find(|c| {
+                // If max age is set, drop all older comments.
+                if let Some(days) = max_age_days.clone() {
+                    if c.created_at < now - Duration::days(days) {
+                        return false;
+                    }
+                }
+                // Only check comments which contain marker.
+                if c.body.contains(marker) == false {
+                    return false;
+                }
+                true
+            })
+            .is_some()
+    }
+
+    pub fn job_url(&self, job_id: u64) -> String {
+        format!("{}/-/jobs/{}", self.project.web_url, job_id)
+    }
+}
+
+struct CacheItem<T> {
+    item: T,
+    valid_until: Option<Instant>,
+}
+
+#[derive(Default)]
+struct Cacher<K: ::std::hash::Hash + ::std::cmp::Eq, V> {
+    items: HashMap<K, CacheItem<V>>,
+}
+
+impl<K: ::std::cmp::Eq + ::std::hash::Hash, V> Cacher<K, V> {
+    fn get(&self, id: &K) -> Option<&V> {
+        self.items.get(id).and_then(|i| {
+            match i.valid_until.as_ref() {
+                Some(x) if x >= &Instant::now() => Some(&i.item),
+                _ => None,
+            }
+        })
+    }
+
+    fn add(&mut self, id: K, value: V, valid_until: Option<Instant>) {
+        self.items.insert(id, CacheItem{
+            item: value,
+            valid_until,
+        });
+    }
+}
+
+#[derive(Default)]
+struct CacheInner {
+    merge_requests: HashMap<u64, FullMergeRequest>,
+    project_configs: Cacher<u64, client::RepoConfig>,
+}
+
+#[derive(Clone)]
+struct Cache(Arc<Mutex<CacheInner>>);
+
+impl Cache {
+    fn new() -> Self {
+        Cache(Arc::new(Mutex::new(CacheInner::default())))
+    }
+
+    fn merge_request_changed(&self, mr: &types::MergeRequest) -> bool {
+        let b = self.0.lock().unwrap();
+        match b.merge_requests.get(&mr.id) {
+            Some(ref x) if x.request.updated_at == mr.updated_at => {
+                false
+            },
+            _ => true,
+        }
+    }
+
+    fn get_merge_request(&self, mr: types::MergeRequest) -> Option<FullMergeRequest> {
+        let b = self.0.lock().unwrap();
+        match b.merge_requests.get(&mr.id) {
+            Some(ref x) if x.request.updated_at == mr.updated_at => {
+                Some((*x).clone())
+            },
+            _ => None,
+        }
+    }
+
+    fn set_merge_request(&self, mr: FullMergeRequest) {
+        let mut b = self.0.lock().unwrap();
+        b.merge_requests.insert(mr.request.id, mr);
+    }
+
+    fn get_project_config(&self, project_id: u64) -> Option<client::RepoConfig> {
+        let b = self.0.lock().unwrap();
+        b.project_configs.get(&project_id).map(|x| x.clone())
+    }
+
+    fn set_project_config(&self, project_id: u64, conf: client::RepoConfig) {
+        let mut b = self.0.lock().unwrap();
+        b.project_configs.add(project_id, conf, Some(Instant::now() + ::std::time::Duration::from_secs(60 * 30)));
+    }
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -29,7 +152,7 @@ impl Config {
         Ok(Config {
             endpoint: url,
             token,
-            interval: 10,
+            interval: 60 * 5, // 5 minutes.
         })
     }
 }
@@ -39,6 +162,7 @@ pub struct Bot {
     config: Config,
     handle: Handle,
     log: Logger,
+    cache: Cache,
     client: client::Gitlab,
 }
 
@@ -50,6 +174,7 @@ impl Bot {
             client: c,
             handle,
             log,
+            cache: Cache::new(),
             config,
         })
     }
@@ -73,7 +198,92 @@ impl Bot {
     }
 
     #[async]
-    fn process_merge_request_reminder(self, mr: types::FullMergeRequest) -> Result<(), Error> {
+    fn cached_repo_config(self, project: types::Project) -> Result<client::RepoConfig, Error> {
+        if let Some(conf) = self.cache.get_project_config(project.id) {
+            // Found cached version.
+            Ok(conf)
+        } else {
+            // No cached version, actually load it.
+            // Load repo config.
+            let repo_config_res = await!(self.client.clone().repo_file(
+                project.id,
+                ".gitlab-bot.toml".to_string(),
+                "master".to_string()
+            )).map_err(Error::from)
+                .and_then(|data| ::toml::from_slice::<client::RepoConfig>(&data).map_err(Error::from));
+
+            let config = match repo_config_res {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Could not load repo config: {}", e);
+                    client::RepoConfig::default()
+                }
+            };
+
+            self.cache.set_project_config(project.id, config.clone());
+
+            Ok(config)
+        }
+    }
+
+    #[async]
+    pub fn full_merge_request(
+        self,
+        mr: types::MergeRequest,
+        bot_id: u64,
+    ) -> Result<FullMergeRequest, Error> {
+        // Check cache first.
+        // Cache will match if updated_at did not change.
+        if let Some(cached_mr) = self.cache.get_merge_request(mr.clone()) {
+            return Ok(cached_mr);
+        }
+
+        let project = await!(self.client.clone().project(mr.project_id))?;
+        let repo_config = await!(self.clone().cached_repo_config(project.clone()))?;
+
+        // Load source branch.
+        let source_branch = await!(self.client.clone().branch(mr.project_id, mr.source_branch.clone()))?;
+
+        let source_branch_commits = await!(self.client.clone().commits(
+            mr.project_id,
+            mr.source_branch.clone(),
+            100
+        ))?;
+
+        let target_branch_commits = await!(self.client.clone().commits(
+            mr.project_id,
+            mr.target_branch.clone(),
+            100
+        ))?;
+
+        // Load comments.
+        let comments = await!(self.client.clone().merge_request_comments(mr.project_id, mr.iid))?;
+        let bot_comments = comments
+            .iter()
+            .filter(|c| c.author.as_ref().map(|a| a.id == bot_id).unwrap_or(false))
+            .map(|x| x.clone())
+            .collect::<Vec<_>>();
+
+        let pipelines = await!(self.client.clone().merge_request_pipelines(mr.project_id, mr.iid))?;
+
+        let full = FullMergeRequest {
+            project,
+            request: mr,
+            source_branch,
+            source_branch_commits,
+            target_branch_commits: target_branch_commits,
+            comments,
+            bot_comments,
+            pipelines,
+            repo_config,
+        };
+
+        self.cache.set_merge_request(full.clone());
+        Ok(full)
+    }
+
+    #[async]
+    fn process_merge_request_reminder(self, mr: FullMergeRequest) -> Result<(), Error> {
         // Check if time reminder is needed.
         let now = Utc::now();
         let reminder_days = 5;
@@ -100,8 +310,14 @@ impl Bot {
 
     #[async]
     fn process_merge_request(self, bot: types::User, mr: types::MergeRequest) -> Result<(), Error> {
+        trace!(self.log, "process_merge_request_start";
+            "project_id" => mr.project_id,
+            "merge_request_id" => mr.id,
+        );
         let project_id = mr.project_id;
-        let mr = await!(self.client.clone().full_merge_request(mr, bot.id))?;
+        let updated_at = mr.updated_at.clone();
+
+        let mr = await!(self.clone().full_merge_request(mr, bot.id))?;
 
         if mr.repo_config.is_disabled() {
             return Ok(());
@@ -295,17 +511,33 @@ impl Bot {
         info!(log, "process_start");
 
         // Get info about the current user.
+        trace!(log, "loading_user");
         let user = await!(self.client.clone().user())?;
+        trace!(log, "user_loaded"; "name" => &user.username);
 
         // Load merge requests.
         let mrs = await!(self.client.clone().merge_requests())?;
+
+        // Filter out unchanged MRs.
+        let mrs = mrs.into_iter()
+            .filter(|mr| {
+                let changed = self.cache.merge_request_changed(mr);
+                if !changed {
+                    trace!(log, "skipping_unchanged_merge_request";
+                        "project_id" => mr.project_id,
+                        "merge_request_title" => &mr.title,
+                    );
+                }
+                changed
+            })
+            .collect::<Vec<_>>();
 
         let bot = self.clone();
         let f = stream::iter_ok(mrs)
             .map(move |mr| {
                 trace!(bot.log.clone(), "merge_request_check";
                     "mr_name" => mr.title.clone(),
-                    "mr_id" => mr.iid,
+                    "mr_id" => mr.id,
                 );
                 let log = bot.log.clone();
                 let res = bot.clone().process_merge_request(user.clone(), mr.clone());
@@ -314,13 +546,13 @@ impl Bot {
                         Ok(_) => {
                             debug!(log, "merge_request_complete";
                                 "mr_name" => mr.title.clone(),
-                                "mr_id" => mr.iid,
+                                "mr_id" => mr.id,
                             );
                         }
                         Err(e) => {
                             error!(log, "merge_request_failed";
                                 "mr_name" => mr.title.clone(),
-                                "mr_id" => mr.iid,
+                                "mr_id" => mr.id,
                                 "error" => e.to_string(),
                             );
                         }
@@ -328,7 +560,7 @@ impl Bot {
                     future::ok::<_, Error>(())
                 })
             })
-            .buffered(5)
+            .buffered(1)
             .collect();
         await!(f)?;
 
@@ -341,7 +573,15 @@ impl Bot {
     fn do_loop(self) -> Result<(), Error> {
         let interval = ::std::time::Duration::from_secs(self.config.interval);
         loop {
-            await!(self.clone().process()).ok();
+            trace!(self.log, "running_loop");
+            match await!(self.clone().process()) {
+                Ok(_) => {},
+                Err(e) => {
+                    error!(self.log, "processing_failed";
+                        "error" => e.to_string(),
+                    );
+                }
+            }
             await!(::tokio_core::reactor::Timeout::new(interval, &self.handle)?).ok();
         }
     }

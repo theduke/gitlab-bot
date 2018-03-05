@@ -1,6 +1,6 @@
 [package]
 name = "gitlab-bot"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Christoph Herzog <chris@theduke.at>"]
 
 [dependencies]
@@ -16,4 +16,6 @@ chrono = { version = "0.4.0", features = ["serde"] }
 futures-await = "0.1.0"
 toml = "0.4.5"
 regex = "0.2.6"
-slog = "2.1.1"
+slog = { version = "2.1.1", features = ["max_level_trace"] }
+openssl-sys = "0.9.26"
+openssl-probe = "0.1.2"

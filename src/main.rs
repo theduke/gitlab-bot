@@ -17,12 +17,22 @@ extern crate sloggers;
 extern crate tokio_core;
 extern crate toml;
 
+// Needed for static musl build.
+// See https://github.com/emk/rust-musl-builder
+extern crate openssl_probe;
+
 mod client;
 mod bot;
 
 use tokio_core::reactor::Core;
 
+
+
 fn main() {
+    // Needed for static musl build.
+    // See https://github.com/emk/rust-musl-builder
+    openssl_probe::init_ssl_cert_env_vars();
+
     let mut core = Core::new().unwrap();
 
     let bot = bot::Bot::from_env(core.handle()).unwrap();
