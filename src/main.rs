@@ -26,8 +26,6 @@ mod bot;
 
 use tokio_core::reactor::Core;
 
-
-
 fn main() {
     // Needed for static musl build.
     // See https://github.com/emk/rust-musl-builder

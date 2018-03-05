@@ -310,4 +310,3 @@ pub struct Job {
   },
   */
 }
-

@@ -1,4 +1,4 @@
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::borrow::Borrow;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -10,6 +10,7 @@ use futures::prelude::*;
 use futures::future;
 use futures::stream;
 use chrono::{Duration, Utc};
+use regex::Regex;
 
 use client;
 use client::types;
@@ -25,7 +26,7 @@ pub struct FullMergeRequest {
     pub bot_comments: Vec<types::Note>,
     pub pipelines: Vec<types::Pipeline>,
 
-    pub repo_config: ::client::RepoConfig,
+    pub repo_config: RepoConfig,
 }
 
 impl FullMergeRequest {
@@ -66,26 +67,29 @@ struct Cacher<K: ::std::hash::Hash + ::std::cmp::Eq, V> {
 
 impl<K: ::std::cmp::Eq + ::std::hash::Hash, V> Cacher<K, V> {
     fn get(&self, id: &K) -> Option<&V> {
-        self.items.get(id).and_then(|i| {
-            match i.valid_until.as_ref() {
+        self.items
+            .get(id)
+            .and_then(|i| match i.valid_until.as_ref() {
                 Some(x) if x >= &Instant::now() => Some(&i.item),
                 _ => None,
-            }
-        })
+            })
     }
 
     fn add(&mut self, id: K, value: V, valid_until: Option<Instant>) {
-        self.items.insert(id, CacheItem{
-            item: value,
-            valid_until,
-        });
+        self.items.insert(
+            id,
+            CacheItem {
+                item: value,
+                valid_until,
+            },
+        );
     }
 }
 
 #[derive(Default)]
 struct CacheInner {
     merge_requests: HashMap<u64, FullMergeRequest>,
-    project_configs: Cacher<u64, client::RepoConfig>,
+    project_configs: Cacher<u64, RepoConfig>,
 }
 
 #[derive(Clone)]
@@ -99,9 +103,7 @@ impl Cache {
     fn merge_request_changed(&self, mr: &types::MergeRequest) -> bool {
         let b = self.0.lock().unwrap();
         match b.merge_requests.get(&mr.id) {
-            Some(ref x) if x.request.updated_at == mr.updated_at => {
-                false
-            },
+            Some(ref x) if x.request.updated_at == mr.updated_at => false,
             _ => true,
         }
     }
@@ -109,9 +111,7 @@ impl Cache {
     fn get_merge_request(&self, mr: types::MergeRequest) -> Option<FullMergeRequest> {
         let b = self.0.lock().unwrap();
         match b.merge_requests.get(&mr.id) {
-            Some(ref x) if x.request.updated_at == mr.updated_at => {
-                Some((*x).clone())
-            },
+            Some(ref x) if x.request.updated_at == mr.updated_at => Some((*x).clone()),
             _ => None,
         }
     }
@@ -121,14 +121,50 @@ impl Cache {
         b.merge_requests.insert(mr.request.id, mr);
     }
 
-    fn get_project_config(&self, project_id: u64) -> Option<client::RepoConfig> {
+    fn get_project_config(&self, project_id: u64) -> Option<RepoConfig> {
         let b = self.0.lock().unwrap();
         b.project_configs.get(&project_id).map(|x| x.clone())
     }
 
-    fn set_project_config(&self, project_id: u64, conf: client::RepoConfig) {
+    fn set_project_config(&self, project_id: u64, conf: RepoConfig) {
         let mut b = self.0.lock().unwrap();
-        b.project_configs.add(project_id, conf, Some(Instant::now() + ::std::time::Duration::from_secs(60 * 30)));
+        b.project_configs.add(
+            project_id,
+            conf,
+            Some(Instant::now() + ::std::time::Duration::from_secs(60 * 30)),
+        );
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct ReportConfig {
+    pub job_name: String,
+    pub path: String,
+    pub format: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct RepoConfig {
+    pub disabled: Option<bool>,
+    pub merge_request_title_pattern: Option<String>,
+    pub merge_request_title_error: Option<String>,
+
+    #[serde(default)]
+    pub reports: Vec<ReportConfig>,
+}
+
+impl RepoConfig {
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.unwrap_or(false)
+    }
+
+    pub fn merge_request_title_regex(&self) -> Option<Regex> {
+        if let Some(pattern) = self.merge_request_title_pattern.as_ref() {
+            if let Ok(re) = Regex::new(pattern) {
+                return Some(re);
+            }
+        }
+        None
     }
 }
 
@@ -198,7 +234,7 @@ impl Bot {
     }
 
     #[async]
-    fn cached_repo_config(self, project: types::Project) -> Result<client::RepoConfig, Error> {
+    fn cached_repo_config(self, project: types::Project) -> Result<RepoConfig, Error> {
         if let Some(conf) = self.cache.get_project_config(project.id) {
             // Found cached version.
             Ok(conf)
@@ -210,13 +246,13 @@ impl Bot {
                 ".gitlab-bot.toml".to_string(),
                 "master".to_string()
             )).map_err(Error::from)
-                .and_then(|data| ::toml::from_slice::<client::RepoConfig>(&data).map_err(Error::from));
+                .and_then(|data| ::toml::from_slice::<RepoConfig>(&data).map_err(Error::from));
 
             let config = match repo_config_res {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("Could not load repo config: {}", e);
-                    client::RepoConfig::default()
+                    RepoConfig::default()
                 }
             };
 
@@ -242,7 +278,11 @@ impl Bot {
         let repo_config = await!(self.clone().cached_repo_config(project.clone()))?;
 
         // Load source branch.
-        let source_branch = await!(self.client.clone().branch(mr.project_id, mr.source_branch.clone()))?;
+        let source_branch = await!(
+            self.client
+                .clone()
+                .branch(mr.project_id, mr.source_branch.clone())
+        )?;
 
         let source_branch_commits = await!(self.client.clone().commits(
             mr.project_id,
@@ -257,14 +297,22 @@ impl Bot {
         ))?;
 
         // Load comments.
-        let comments = await!(self.client.clone().merge_request_comments(mr.project_id, mr.iid))?;
+        let comments = await!(
+            self.client
+                .clone()
+                .merge_request_comments(mr.project_id, mr.iid)
+        )?;
         let bot_comments = comments
             .iter()
             .filter(|c| c.author.as_ref().map(|a| a.id == bot_id).unwrap_or(false))
             .map(|x| x.clone())
             .collect::<Vec<_>>();
 
-        let pipelines = await!(self.client.clone().merge_request_pipelines(mr.project_id, mr.iid))?;
+        let pipelines = await!(
+            self.client
+                .clone()
+                .merge_request_pipelines(mr.project_id, mr.iid)
+        )?;
 
         let full = FullMergeRequest {
             project,
@@ -575,7 +623,7 @@ impl Bot {
         loop {
             trace!(self.log, "running_loop");
             match await!(self.clone().process()) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     error!(self.log, "processing_failed";
                         "error" => e.to_string(),

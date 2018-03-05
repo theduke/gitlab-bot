@@ -8,39 +8,6 @@ use reqwest::unstable::async::Client;
 use reqwest::{self, Url};
 use reqwest::unstable::async;
 use failure::Error;
-use regex::Regex;
-
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
-pub struct ReportConfig {
-    pub job_name: String,
-    pub path: String,
-    pub format: Option<String>,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
-pub struct RepoConfig {
-    pub disabled: Option<bool>,
-    pub merge_request_title_pattern: Option<String>,
-    pub merge_request_title_error: Option<String>,
-
-    #[serde(default)]
-    pub reports: Vec<ReportConfig>,
-}
-
-impl RepoConfig {
-    pub fn is_disabled(&self) -> bool {
-        self.disabled.unwrap_or(false)
-    }
-
-    pub fn merge_request_title_regex(&self) -> Option<Regex> {
-        if let Some(pattern) = self.merge_request_title_pattern.as_ref() {
-            if let Ok(re) = Regex::new(pattern) {
-                return Some(re);
-            }
-        }
-        None
-    }
-}
 
 /// Gitlab client struct.
 #[derive(Clone)]
@@ -376,6 +343,4 @@ impl Gitlab {
 
         Ok(())
     }
-
-
 }
