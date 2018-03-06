@@ -144,11 +144,29 @@ pub struct ReportConfig {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
+pub struct RepoMergeRequestConfig {
+    pub title_pattern: Option<String>,
+    pub title_error: Option<String>,
+    pub branch_name_pattern: Option<String>,
+    pub branch_name_error: Option<String>,
+}
+
+impl RepoMergeRequestConfig {
+    pub fn title_regex(&self) -> Option<Regex> {
+        self.title_pattern.as_ref()
+            .and_then(|p| Regex::new(p).ok())
+    }
+
+    pub fn branch_regex(&self) -> Option<Regex> {
+        self.branch_name_pattern.as_ref()
+            .and_then(|p| Regex::new(p).ok())
+    }
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
 pub struct RepoConfig {
     pub disabled: Option<bool>,
-    pub merge_request_title_pattern: Option<String>,
-    pub merge_request_title_error: Option<String>,
-
+    pub merge_requests: Option<RepoMergeRequestConfig>,
     #[serde(default)]
     pub reports: Vec<ReportConfig>,
 }
@@ -158,14 +176,6 @@ impl RepoConfig {
         self.disabled.unwrap_or(false)
     }
 
-    pub fn merge_request_title_regex(&self) -> Option<Regex> {
-        if let Some(pattern) = self.merge_request_title_pattern.as_ref() {
-            if let Ok(re) = Regex::new(pattern) {
-                return Some(re);
-            }
-        }
-        None
-    }
 }
 
 #[derive(Clone)]
@@ -378,39 +388,82 @@ impl Bot {
 
         let mut validation_msg = String::new();
 
-        // If configured, validate the merge request title.
-        if let Some(re) = mr.repo_config.merge_request_title_regex() {
-            let is_valid = re.is_match(&mr.request.title);
-            if !is_valid {
-                // Check if warning is needed.
-                let has_warning = mr.has_bot_comment("[title_warning]", None);
-                if !has_warning {
-                    // No warning present, so post a comment.
-                    let err = mr.repo_config
-                        .merge_request_title_error
-                        .clone()
-                        .unwrap_or(format!(
-                            "Merge request title must match the pattern: `{}`",
-                            re.to_string()
-                        ));
+        if let Some(mr_config) = mr.repo_config.merge_requests.clone() {
+            // If configured, validate the merge request title.
+            if let Some(re) = mr_config.title_regex() {
+                let is_valid = re.is_match(&mr.request.title);
+                if !is_valid {
+                    // Check if warning is needed.
+                    let has_warning = mr.has_bot_comment("[title_warning]", None);
+                    if !has_warning {
+                        // No warning present, so post a comment.
+                        let err = mr_config
+                            .title_error
+                            .clone()
+                            .unwrap_or(format!(
+                                "Merge request title should match the pattern: `{}`",
+                                re.to_string()
+                            ));
 
-                    let comment_body = format!(
-                        "@{}\n\nThe merge request title is invalid. \n{}\n\n[title_warning]",
-                        mr.request.author.username, err
-                    );
+                        let comment_body = format!(
+                            "@{}\n\nThe merge request title is invalid. \n{}\n\n[title_warning]",
+                            mr.request.author.username, err
+                        );
 
-                    await!(self.client.clone().merge_request_comment_create(
-                        project_id,
-                        mr.request.iid,
-                        comment_body
-                    ))?;
+                        await!(self.client.clone().merge_request_comment_create(
+                            project_id,
+                            mr.request.iid,
+                            comment_body
+                        ))?;
+                    }
                 }
+                validation_msg.push_str(&format!(
+                    "- [{}] Valid Merge Request Title{} \n",
+                    if is_valid { "x" } else { " " },
+                    if is_valid { "" } else { " :warning:" },
+                ));
             }
-            validation_msg.push_str(&format!(
-                "- [{}] Valid Merge Request Title{} \n",
-                if is_valid { "x" } else { " " },
-                if is_valid { "" } else { " :warning:" },
-            ));
+
+
+            // If configured, validate the branch name.
+            if let Some(re) = mr_config.branch_regex() {
+                let is_valid = re.is_match(&mr.source_branch.name);
+                if !is_valid {
+                    // Check if warning is needed.
+                    let has_warning = mr.has_bot_comment("[branch_name_warning]", None);
+                    if !has_warning {
+                        // No warning present, so post a comment.
+                        let err = mr_config
+                            .branch_name_error
+                            .clone()
+                            .unwrap_or(format!(
+                                "Branch name should match the pattern: `{}`",
+                                re.to_string()
+                            ));
+
+                        let comment_body = format!(
+                            "@{}\n\nThe branch name is invalid. \n{}\n\n[branch_name_warning]",
+                            mr.request.author.username, err
+                        );
+
+                        debug!(self.log, "posting_branch_name_warning";
+                            "branch_name" => &mr.source_branch.name,
+                            "err" => &err,
+                        );
+
+                        await!(self.client.clone().merge_request_comment_create(
+                            project_id,
+                            mr.request.iid,
+                            comment_body
+                        ))?;
+                    }
+                }
+                validation_msg.push_str(&format!(
+                    "- [{}] Valid Branch Name{} \n",
+                    if is_valid { "x" } else { " " },
+                    if is_valid { "" } else { " :warning:" },
+                ));
+            }
         }
 
         if mr.request.assignee.is_none() {
@@ -608,7 +661,7 @@ impl Bot {
                     future::ok::<_, Error>(())
                 })
             })
-            .buffered(1)
+            .buffered(5)
             .collect();
         await!(f)?;
 
