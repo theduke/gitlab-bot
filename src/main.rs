@@ -16,12 +16,14 @@ extern crate slog;
 extern crate sloggers;
 extern crate tokio_core;
 extern crate toml;
+extern crate xmltree;
 
 // Needed for static musl build.
 // See https://github.com/emk/rust-musl-builder
 extern crate openssl_probe;
 
 mod client;
+mod reports;
 mod bot;
 
 use tokio_core::reactor::Core;

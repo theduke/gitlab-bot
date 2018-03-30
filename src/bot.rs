@@ -15,6 +15,21 @@ use regex::Regex;
 use client;
 use client::types;
 
+fn escape_html(data: &str) -> String {
+    let mut clean = String::new();
+    for c in data.chars() {
+        match c {
+            '"' => clean.push_str("&quot;"),
+            '&' => clean.push_str("&amp;"),
+            '\'' => clean.push_str("&#x27;"),
+            '<' => clean.push_str("&lt;"),
+            '>' => clean.push_str("&gt;"),
+            x => clean.push(x)
+        }
+    }
+    clean
+}
+
 #[derive(Clone, Debug)]
 pub struct FullMergeRequest {
     pub project: types::Project,
@@ -134,6 +149,12 @@ impl Cache {
             Some(Instant::now() + ::std::time::Duration::from_secs(60 * 30)),
         );
     }
+}
+
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReportConfigFormat {
+    PHPUnitXml,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]
@@ -491,20 +512,25 @@ impl Bot {
 
             msg.push_str("## Build Status\n\n");
 
-            /*
-            let mut artifacts_info = "";
-            if pipelie.status != "pending" {
-                for job in &jobs {
-                    for report in &mr.config.reports {
+            let mut artifacts_info = String::new();
+            if pipeline.status != "pending" {
+                for job in jobs.clone() {
+                    for report in mr.repo_config.reports.clone() {
                         if report.job_name == job.name {
                             let file_res = await!(self.client.clone()
                                 .job_artifact_file(project_id, job.id, report.path.clone())
                             );
+                            match file_res {
+                                Ok(data) => {
+                                },
+                                Err(e) => {
+                                    artifacts_info.push_str(&format!("Could not fetch artifact file: {}", report.path));
+                                },
+                            }
                         }
                     }
                 }
             }
-            */
 
             if pipeline.status == "failed" {
                 // Found a failed pipeline!
@@ -523,7 +549,7 @@ impl Bot {
                          <pre><code>{}</code></pre>\
                          </details><br>\n\
                          ",
-                        job.name, job_url, trace,
+                        job.name, job_url, escape_html(&trace),
                     ));
                 }
             } else if pipeline.status == "success" {
@@ -592,8 +618,12 @@ impl Bot {
             }
 
             // Delete older build reports.
-            for comment in mr.bot_comments.into_iter().skip(1) {
+            for comment in mr.bot_comments.into_iter() {
                 if comment.body.contains("[report]") {
+                    if Some(comment.id) == update_id {
+                        // Skip the updated comment.
+                        continue;
+                    }
                     await!(self.client.clone().merge_request_comment_delete(
                         project_id,
                         mr.request.iid,
